@@ -1,0 +1,731 @@
+#!/bin/bash
+# ============================================================================
+# ServPing — 通用服务探活（输出格式仿 ping），支持多台主机 × 多个服务
+# ----------------------------------------------------------------------------
+# 用法:
+#   ServPing [Host名] [服务名] [选项]        # 位序：先 Host，后服务
+#   ServPing -a Host "<名称>" <地址>          # 登记一台主机（可多台）
+#   ServPing -a ServPort <名称> <端口> [描述] [proto] [响应体关键字]
+#   ServPing -rm
+#   ServPing -l
+#
+# 配置模型（记录式，一行一条）:
+#   Host "FnOS"  192.168.1.10
+#   Host "Local" 127.0.0.1
+#   ServPort "Self" 5666 "FnOS管理界面" http
+#   ServPort "Git"  3000 "Gitea服务"    http "Gitea"
+#   ServPort "SSH"  22   "SSH服务"      tcp
+#
+# ★Host 与 ServPort 是**两张独立表**：Host 是地址簿，ServPort 是服务表，
+#   同一套服务名可以对任意 Host 使用。
+#   Host 两种写法:
+#     Host "FnOS" 192.168.1.10    具名（推荐，命令里用 FnOS）
+#     Host 192.168.1.10           旧式，名称缺省 = 地址本身
+#
+# 命令示例:
+#   ServPing                     # 缺省 Host（第一条）× 缺省服务（第一条）
+#   ServPing FnOS                # FnOS × 缺省服务
+#   ServPing fnos self           # 名字大小写不敏感
+#   ServPing local git           # Local × Gitea
+#   ServPing Git                 # 兼容老用法：第 1 个词不是 Host 名 ⇒ 当服务名
+#
+# ★字段顺序（ServPort 第 5 位起可省略）:
+#   1=ServPort 关键字  2=名称  3=端口  4=描述  5=proto  6=响应体关键字
+#   proto: http（缺省）| tcp
+#     http — 校验 HTTP 200（有第 6 字段时再校验响应体包含该关键字）
+#     tcp  — 只判 TCP 三次握手是否建立，可用于 SSH / MySQL 等非 HTTP 服务
+#
+# ★★唯一原则：一律取第一条
+#   1. 缺省 Host = **第一条** Host（不给 Host 时用它）
+#   2. 缺省服务 = **第一条** ServPort（不给服务时用它）
+#   3. 同名 Host / 同名 ServPort 各自 **只认第一条**（后加的保留但不生效，大小写不敏感）
+#   —— 缺省位写坏了直接报错，绝不让位给后面（让位 = 缺省随顺序漂移 = 假阴性）。
+#
+# ★位置参数歧义处理：第 1 个位置参数**先按 Host 名解析**，解析不到才当服务名
+#   （保老命令 ServPing Git 可用）。若某个名字同时是 Host 名和服务名，它会被判为
+#   Host —— 此时用 -H 指 Host、位置参数留给服务，或用 -s 显式指定服务。
+#
+# ★配置写坏 = 退出码 2，不静默跳过（含：Host 缺地址/缺名称、ServPort 缺字段、
+#   端口非数字、proto 非 http|tcp）。报错会带**行号**。
+#
+# ★v2.x 不兼容提示:
+#   · v1.x 第 5 字段是"响应体关键字"，本版第 5 字段是 proto（老配置会报错并给出修正行）
+#   · v2.x 的 ServPing <服务名> 仍可用（位置参数回退），但更推荐 <Host> <服务>
+#
+# 选项:
+#   -a TYPE ...  追加配置：Host <地址> | Host "<名称>" <地址>
+#                | ServPort <名称> <端口> [描述] [proto] [关键字]
+#   -rm          删除配置文件
+#   -H HOST      显式指定 Host（可给已登记的名字或字面地址）
+#   -s SERVICE   显式指定服务名（用于解开位置参数歧义）
+#   -c N         探测次数（缺省 4）
+#   -i SEC       探测间隔秒（缺省 1）
+#   -W SEC       单次超时秒（缺省 5）
+#   -p PORT      临时覆盖端口（不写配置）
+#   -f FILE      指定配置文件（缺省 /usr/local/etc/servping.conf）
+#   -t           本次强制按 tcp 探活（优先级高于配置里的 proto）
+#   -l           列出 Hosts 与服务（含 proto）
+#   -V           版本
+#   -h           帮助
+#
+# 配置文件路径: -f 指定 > $SERVPING_CONFIG > /usr/local/etc/servping.conf
+#
+# 退出码:
+#   0  全部成功    1  存在失败（含全部失败）    2  参数/配置错误
+#
+# ★口径说明（两种 proto 的 time= 不可横向比较）
+#   http: time= **HTTP 全链路**（TCP 建连 + 请求往返 + 响应传输）
+#   tcp : time= 只取 curl 的 %{time_connect}（纯 TCP 握手），可与 tcpping / ping 类比
+#   -t 与 proto=tcp 同一口径。
+#
+# ★tcp 判定口径: curl 退出码为 0，或 %{time_connect} 非零（非零即 connect() 已
+#   成功返回）。服务不响应 HTTP 时 curl 会报 52/56/28 等，但握手本身是通的，
+#   仍判成功 —— 这正是 tcp 模式要的语义。
+#
+# 兼容性: macOS 自带 bash 3.2 / Linux bash 均可（不依赖关联数组、不依赖 date +%N）。
+# ============================================================================
+
+VERSION="3.0.0"
+PROG="ServPing"
+
+DEF_FILE="/usr/local/etc/servping.conf"
+DEF_COUNT="4"
+DEF_INTERVAL="1"
+DEF_TIMEOUT="5"
+
+# ---------------------------------------------------------------------------
+die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit 2; }
+
+usage() {
+    awk 'NR>2 && /^# ?[-=]+$/ { next }
+         NR>2 && /^#/ { sub(/^# ?/, ""); print; next }
+         NR>2 && !/^#/ { exit }' "$0"
+}
+
+to_ms() { awk -v v="$1" 'BEGIN{ if (v=="") v=0; printf "%.2f", v*1000 }'; }
+
+conf_path() {
+    if [ -n "$opt_conf" ]; then printf '%s' "$opt_conf"; return; fi
+    if [ -n "${SERVPING_CONFIG:-}" ]; then printf '%s' "$SERVPING_CONFIG"; return; fi
+    printf '%s' "$DEF_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# 把一行拆成字段（支持双引号包裹含空格的内容），输出以 0x1F 分隔
+# 用 awk 状态机而非 eval —— 配置文件内容不会被当命令执行
+line_fields() {
+    printf '%s' "$1" | awk '
+    function tokenize(s, out,   n, cur, inq, i, c) {
+        n = 0; cur = ""; inq = 0
+        for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c == "\"") { inq = !inq; continue }
+            if ((c == " " || c == "\t") && !inq) {
+                if (cur != "") { out[++n] = cur; cur = "" }
+                continue
+            }
+            cur = cur c
+        }
+        if (cur != "") out[++n] = cur
+        return n
+    }
+    {
+        n = tokenize($0, f)
+        for (i = 1; i <= n; i++) printf "%s%s", f[i], (i < n ? "\037" : "")
+    }'
+}
+
+# ---------------------------------------------------------------------------
+# 读配置 → HOST_NAME[] HOST_ADDR[] / SVC_NAME[] SVC_PORT[] SVC_DESC[] SVC_PROTO[] SVC_BODY[]
+# ---------------------------------------------------------------------------
+HOST_NAME=()
+HOST_ADDR=()
+SVC_NAME=()
+SVC_PORT=()
+SVC_DESC=()
+SVC_PROTO=()
+SVC_BODY=()
+RAW_HOST_COUNT=0
+RAW_SVC_COUNT=0
+DUP_NAMES=""
+DUP_HOSTS=""
+
+# 按名字查下标（大小写不敏感），命中则打印下标并返回 0
+svc_index() {
+    local i n
+    n=${#SVC_NAME[@]}
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ "$(printf '%s' "${SVC_NAME[$i]}" | tr 'A-Z' 'a-z')" = \
+             "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" ]; then
+            printf '%s' "$i"; return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+host_index() {
+    local i n
+    n=${#HOST_NAME[@]}
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ "$(printf '%s' "${HOST_NAME[$i]}" | tr 'A-Z' 'a-z')" = \
+             "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" ]; then
+            printf '%s' "$i"; return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+load_conf() {
+    local file="$1" line fields kw nh ad nm pt ds pv pv_raw bd idx n ln
+    [ -r "$file" ] || return 1
+
+    # ★重置：load_conf 必须幂等（被 -a 路径重复调用时不能把条目翻倍）
+    HOST_NAME=(); HOST_ADDR=()
+    SVC_NAME=(); SVC_PORT=(); SVC_DESC=(); SVC_PROTO=(); SVC_BODY=()
+    RAW_HOST_COUNT=0; RAW_SVC_COUNT=0
+    DUP_NAMES=""; DUP_HOSTS=""
+    ln=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        ln=$((ln + 1))
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        fields=$(line_fields "$line")
+        [ -n "$fields" ] || continue
+        IFS=$'\x1f' read -r -a F <<< "$fields"
+        n=${#F[@]}
+        [ "$n" -ge 1 ] || continue
+        kw="${F[0]}"
+        case "$kw" in
+            Host)
+                RAW_HOST_COUNT=$((RAW_HOST_COUNT + 1))
+                # 两种写法：
+                #   Host 192.168.1.10                 （旧式，名称 = 地址本身）
+                #   Host "FnOS" 192.168.1.10          （具名，推荐）
+                if [ "$n" -ge 3 ]; then
+                    nh="${F[1]}"; ad="${F[2]}"
+                elif [ "$n" -eq 2 ] && [ -n "${F[1]}" ]; then
+                    nh="${F[1]}"; ad="${F[1]}"
+                else
+                    die "配置第 ${ln} 行：Host 缺少地址
+  正确写法：Host 192.168.1.10
+        或  Host \"FnOS\" 192.168.1.10
+  ★Host 写坏了不会跳过、也不会让后面的 Host 顶替缺省位。"
+                fi
+                [ -n "$ad" ] || die "配置第 ${ln} 行：Host \"${nh}\" 的地址为空"
+                [ -n "$nh" ] || die "配置第 ${ln} 行：Host 名称为空"
+                if host_index "$nh" >/dev/null 2>&1; then
+                    DUP_HOSTS="${DUP_HOSTS} ${nh}"
+                else
+                    HOST_NAME+=("$nh")
+                    HOST_ADDR+=("$ad")
+                fi
+                ;;
+            ServPort)
+                RAW_SVC_COUNT=$((RAW_SVC_COUNT + 1))
+                # ★缺省服务 = 第一条 ServPort。所以第一条/任何一条写坏都不能"跳过"，
+                #   跳过就等于让后面的记录顶替缺省位 —— 属于静默走偏。
+                if [ "$n" -lt 3 ]; then
+                    die "配置第 ${ln} 行：ServPort 至少需要 <名称> <端口>
+  正确写法：ServPort \"Self\" 5666 \"FnOS管理界面\" [proto] [关键字]"
+                fi
+                nm="${F[1]}"; pt="${F[2]}"; ds=""; pv=""; bd=""
+                [ "$n" -ge 4 ] && ds="${F[3]}"
+                # ★第 5 字段 = proto（http|tcp，用得更多），第 6 字段 = 响应体关键字
+                [ "$n" -ge 5 ] && pv="${F[4]}"
+                [ "$n" -ge 6 ] && bd="${F[5]}"
+                case "$pt" in
+                    ''|*[!0-9]*)
+                        die "配置第 ${ln} 行：ServPort \"${nm}\" 的端口不是数字：'${pt}'" ;;
+                esac
+                if [ -z "$pv" ]; then pv="http"; fi
+                pv_raw="$pv"                      # 保留原样，仅用于报错回显
+                pv=$(printf '%s' "$pv" | tr 'A-Z' 'a-z')
+                case "$pv" in
+                    http|tcp) ;;
+                    *)
+                        die "配置第 ${ln} 行：ServPort \"${nm}\" 的 proto 非法：'${pv_raw}'
+  proto 只允许 http（缺省）或 tcp。
+  ★若这是从旧版 v1.x 迁来的配置，第 5 位原本是响应体关键字 ——
+    请改成：ServPort \"${nm}\" ${pt} \"${ds}\" http \"${pv_raw}\""
+                        ;;
+                esac
+                if svc_index "$nm" >/dev/null 2>&1; then
+                    DUP_NAMES="${DUP_NAMES} ${nm}"
+                else
+                    SVC_NAME+=("$nm")
+                    SVC_PORT+=("$pt")
+                    SVC_DESC+=("$ds")
+                    SVC_PROTO+=("$pv")
+                    SVC_BODY+=("$bd")
+                fi
+                ;;
+        esac
+    done < "$file"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# -a 追加配置
+# ---------------------------------------------------------------------------
+do_add() {
+    local file="$1" type="$2"
+    shift 2
+
+    [ -n "$file" ] || die "无法确定配置文件路径"
+    mkdir -p "$(dirname "$file")" 2>/dev/null
+
+    case "$type" in
+        Host)
+            [ $# -ge 1 ] || die "-a Host 需要 <地址> 或 \"<名称>\" <地址>"
+            local nh ad existed before
+            if [ $# -ge 2 ]; then nh="$1"; ad="$2"; else nh="$1"; ad="$1"; fi
+            [ -n "$ad" ] || die "Host 地址不能为空"
+
+            load_conf "$file"                       # 先看现状（判重 + 判缺省）
+            existed=0
+            if host_index "$nh" >/dev/null 2>&1; then existed=1; fi
+            before=${#HOST_ADDR[@]}
+
+            if [ $# -ge 2 ]; then
+                printf 'Host "%s" %s\n' "$nh" "$ad" >> "$file" || die "写入失败：${file}"
+                printf '已追加: Host "%s" %s\n' "$nh" "$ad"
+            else
+                printf 'Host %s\n' "$ad" >> "$file" || die "写入失败：${file}"
+                printf '已追加: Host %s    （未给名称，名称缺省 = 地址本身）\n' "$ad"
+            fi
+
+            if [ "$existed" -eq 1 ]; then
+                printf '注意: 同名 Host "%s" 已存在，按"同名只认第一条"，本条不生效。\n' "$nh"
+            elif [ "$before" -eq 0 ]; then
+                printf '本条已生效，并且是**缺省 Host**（第一条）。\n'
+            else
+                printf '本条已生效。用法：%s %s <服务名>\n' "$PROG" "$nh"
+            fi
+            ;;
+        ServPort|Service)
+            [ $# -ge 2 ] || die "-a ServPort 需要 <名称> <端口> [描述] [proto] [关键字]"
+            local nm="$1" pt="$2" ds="${3:-}" pv="${4:-}" bd="${5:-}"
+            case "$pt" in
+                ''|*[!0-9]*) die "端口必须是数字：${pt}" ;;
+            esac
+            # 兼容：省略描述直接给 proto（如 ... 22 tcp）时，把描述位让给 proto
+            if [ -z "$pv" ] && [ -n "$ds" ]; then
+                case "$(printf '%s' "$ds" | tr 'A-Z' 'a-z')" in
+                    http|tcp) pv="$ds"; ds="" ;;
+                esac
+            fi
+            if [ -z "$ds" ]; then ds="$nm"; fi
+            if [ -z "$pv" ]; then pv="http"; fi
+            pv=$(printf '%s' "$pv" | tr 'A-Z' 'a-z')
+            case "$pv" in
+                http|tcp) ;;
+                *) die "proto 只能是 http 或 tcp，收到：${pv}" ;;
+            esac
+            if [ "$pv" = "tcp" ] && [ -n "$bd" ]; then
+                printf '注意: proto=tcp 不校验响应体，已忽略关键字 "%s"\n' "$bd"
+                bd=""
+            fi
+
+            # 先看是否已存在同名（判断本条是否会生效）
+            load_conf "$file"
+            local existed=0
+            if svc_index "$nm" >/dev/null 2>&1; then existed=1; fi
+
+            # 文件里只写必要字段：proto=http 且无 body 时省略 proto
+            if [ -n "$bd" ]; then
+                printf 'ServPort "%s" %s "%s" %s "%s"\n' "$nm" "$pt" "$ds" "$pv" "$bd" >> "$file" \
+                    || die "写入失败：${file}"
+            elif [ "$pv" = "http" ]; then
+                printf 'ServPort "%s" %s "%s"\n' "$nm" "$pt" "$ds" >> "$file" \
+                    || die "写入失败：${file}"
+            else
+                printf 'ServPort "%s" %s "%s" %s\n' "$nm" "$pt" "$ds" "$pv" >> "$file" \
+                    || die "写入失败：${file}"
+            fi
+
+            printf '已追加: ServPort "%s" %s "%s"' "$nm" "$pt" "$ds"
+            [ "$pv" != "http" ] && printf ' %s' "$pv"
+            [ -n "$bd" ] && printf ' "%s"' "$bd"
+            printf '\n'
+            if [ "$existed" -eq 1 ]; then
+                printf '注意: 同名 ServPort "%s" 已存在，按规则**只认第一条**，本条不生效。\n' "$nm"
+            else
+                printf '本条已生效。\n'
+            fi
+            ;;
+        *)
+            die "未知的 -a 类型：${type}（可用：Host | ServPort）"
+            ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 探测一次
+# ---------------------------------------------------------------------------
+probe() {
+    local url="$1" expect_body="$2" proto="$3"
+    local body rc w code t_total t_conn size
+
+    body=$(mktemp "${TMPDIR:-/tmp}/servping.XXXXXX") || die "无法创建临时文件"
+
+    w=$(curl -s -o "$body" \
+            -w '%{http_code} %{time_total} %{time_connect} %{size_download}' \
+            --noproxy '*' \
+            --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
+            -A "$PROG/$VERSION" \
+            "$url" 2>/dev/null)
+    rc=$?
+
+    # curl 的 -w 在失败时照样输出，故先取值再判 rc
+    code=$(printf '%s' "$w" | awk '{print $1}')
+    t_total=$(printf '%s' "$w" | awk '{print $2}')
+    t_conn=$(printf '%s' "$w" | awk '{print $3}')
+    size=$(printf '%s' "$w" | awk '{print $4}')
+
+    # ---- proto=tcp：只判 TCP 三次握手是否建立 ----
+    # 判据: curl 退出码为 0，或 time_connect 非零（非零 ⇒ connect() 已返回成功）。
+    # 服务不响应 HTTP 时 curl 报 52/56/28 等，但握手本身是通的，仍判成功。
+    if [ "$proto" = "tcp" ]; then
+        if [ "$t_conn" != "0.000000" ] && [ -n "$t_conn" ]; then
+            rm -f "$body"
+            printf 'OK|%s|%s|%s' "$(to_ms "$t_conn")" "${size:-0}" "${code:-000}"
+            return 0
+        fi
+        rm -f "$body"
+        case $rc in
+            0)  printf 'tcp connect not established' ;;
+            28) printf 'Connection timeout' ;;
+            7)  printf 'Connection refused' ;;
+            6)  printf 'Could not resolve host' ;;
+            *)  printf 'curl error %d' "$rc" ;;
+        esac
+        return 1
+    fi
+
+    # ---- proto=http：整链路 + 状态码 + 可选响应体 ----
+    if [ $rc -ne 0 ]; then
+        rm -f "$body"
+        case $rc in
+            28) printf 'Request timeout' ;;
+            7)  printf 'Connection refused' ;;
+            6)  printf 'Could not resolve host' ;;
+            35) printf 'TLS handshake failed' ;;
+            *)  printf 'curl error %d' "$rc" ;;
+        esac
+        return 1
+    fi
+
+    if [ "$code" != "200" ]; then
+        rm -f "$body"
+        printf 'HTTP %s unexpected (expect 200)' "$code"
+        return 1
+    fi
+
+    if [ -n "$expect_body" ]; then
+        if ! grep -qF -- "$expect_body" "$body" 2>/dev/null; then
+            rm -f "$body"
+            printf 'body mismatch (expect "%s")' "$expect_body"
+            return 1
+        fi
+    fi
+
+    rm -f "$body"
+    printf 'OK|%s|%s|%s' "$(to_ms "$t_total")" "${size:-0}" "$code"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+opt_service=""
+opt_service2=""
+opt_svc=""
+opt_count=""
+opt_interval=""
+opt_timeout=""
+opt_host=""
+opt_port=""
+opt_conf=""
+opt_tcp=0
+opt_list=0
+opt_add=""      # Host | ServPort
+add_args=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -a|--add)
+            [ $# -ge 2 ] || die "$1 缺少类型（Host | ServPort）"
+            opt_add="$2"
+            shift 2
+            add_args=()
+            case "$opt_add" in
+                Host)
+                    [ $# -ge 1 ] || die "-a Host 需要 <地址> 或 \"<名称>\" <地址>"
+                    add_args=("$1"); shift
+                    # 第二个非选项参数 = 地址（具名写法 Host "FnOS" 192.168.1.10）
+                    if [ $# -ge 1 ] && [ "${1#-}" = "$1" ]; then add_args+=("$1"); shift; fi
+                    ;;
+                ServPort|Service)
+                    [ $# -ge 2 ] || die "-a ServPort 需要 <名称> <端口> [描述] [proto] [关键字]"
+                    add_args=("$1" "$2"); shift 2
+                    if [ $# -ge 1 ] && [ "${1#-}" = "$1" ]; then add_args+=("$1"); shift; fi
+                    if [ $# -ge 1 ] && [ "${1#-}" = "$1" ]; then add_args+=("$1"); shift; fi
+                    if [ $# -ge 1 ] && [ "${1#-}" = "$1" ]; then add_args+=("$1"); shift; fi
+                    ;;
+                *)
+                    die "未知的 -a 类型：${opt_add}（可用：Host | ServPort）" ;;
+            esac
+            ;;
+        -rm|--remove)
+            opt_rm=1; shift ;;
+        -c|--count)      [ $# -ge 2 ] || die "$1 缺少参数"; opt_count="$2"; shift 2 ;;
+        -i|--interval)   [ $# -ge 2 ] || die "$1 缺少参数"; opt_interval="$2"; shift 2 ;;
+        -W|--timeout)    [ $# -ge 2 ] || die "$1 缺少参数"; opt_timeout="$2"; shift 2 ;;
+        -H|--host)       [ $# -ge 2 ] || die "$1 缺少参数"; opt_host="$2"; shift 2 ;;
+        -p|--port)       [ $# -ge 2 ] || die "$1 缺少参数"; opt_port="$2"; shift 2 ;;
+        -s|--service)    [ $# -ge 2 ] || die "$1 缺少参数"; opt_svc="$2"; shift 2 ;;
+        -f|--config)     [ $# -ge 2 ] || die "$1 缺少参数"; opt_conf="$2"; shift 2 ;;
+        -t|--tcp-only)   opt_tcp=1; shift ;;
+        -l|--list)       opt_list=1; shift ;;
+        -V|--version)    printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; break ;;
+        -*)              die "未知选项：$1（用 -h 看帮助）" ;;
+        *)
+            # 位置参数最多两个：<Host> [服务]
+            if [ -z "$opt_service" ]; then opt_service="$1"; shift
+            elif [ -z "$opt_service2" ]; then opt_service2="$1"; shift
+            else die "多余的参数：$1（最多 <Host> [服务] 两个位置参数）"; fi
+            ;;
+    esac
+done
+
+CONF=$(conf_path)
+
+# ---------------------------- -rm ------------------------------------------
+if [ "${opt_rm:-0}" = "1" ]; then
+    if [ -e "$CONF" ]; then
+        rm -f "$CONF" || die "删除失败：${CONF}"
+        printf '已删除配置文件: %s\n' "$CONF"
+    else
+        printf '配置文件不存在: %s\n' "$CONF"
+    fi
+    exit 0
+fi
+
+# ---------------------------- -a -------------------------------------------
+if [ -n "$opt_add" ]; then
+    do_add "$CONF" "$opt_add" "${add_args[@]}"
+    exit 0
+fi
+
+# ---------------------------- 读配置 ---------------------------------------
+if [ ! -e "$CONF" ]; then
+    die "没有配置文件：${CONF}
+  请先添加配置，例如：
+    ${PROG} -a Host \"FnOS\" 192.168.1.10
+    ${PROG} -a ServPort \"Self\" 5666 \"FnOS管理界面\"
+    ${PROG} -a ServPort \"Git\" 3000 \"Gitea服务\""
+fi
+
+# load_conf 对坏行直接 die（退出码 2），不"跳过 + 告警" —— 跳过会让
+# 缺省位（第一条 Host / 第一条 ServPort）被后面的记录顶替，属静默走偏。
+load_conf "$CONF"
+
+[ "${#HOST_ADDR[@]}" -gt 0 ] || die "配置里没有 Host 记录
+  请先添加：${PROG} -a Host \"FnOS\" 192.168.1.10"
+
+if [ "${#SVC_NAME[@]}" -eq 0 ]; then
+    die "配置文件里没有 ServPort 记录：${CONF}
+  请先添加：${PROG} -a ServPort \"Self\" 5666 \"FnOS管理界面\""
+fi
+
+TIMEOUT="${opt_timeout:-$DEF_TIMEOUT}"
+INTERVAL="${opt_interval:-$DEF_INTERVAL}"
+COUNT="${opt_count:-$DEF_COUNT}"
+
+# ---------------------------- -l -------------------------------------------
+if [ "$opt_list" = "1" ]; then
+    printf '配置文件: %s\n' "$CONF"
+    printf 'Hosts（* = 缺省，即第一条 Host）:\n'
+    n=${#HOST_NAME[@]}; i=0
+    while [ "$i" -lt "$n" ]; do
+        mark=" "
+        [ "$i" -eq 0 ] && mark="*"
+        line=$(printf '  %s %-10s %s' "$mark" "${HOST_NAME[$i]}" "${HOST_ADDR[$i]}")
+        if [ "${HOST_NAME[$i]}" = "${HOST_ADDR[$i]}" ]; then
+            line="${line}    （未具名，名称=地址）"
+        fi
+        printf '%s\n' "$line"
+        i=$((i + 1))
+    done
+    if [ -n "$DUP_HOSTS" ]; then
+        printf '未生效（同名 Host 重复）:%s\n' "$DUP_HOSTS"
+    fi
+    printf '服务（* = 缺省，即第一条 ServPort）:\n'
+    n=${#SVC_NAME[@]}; i=0
+    while [ "$i" -lt "$n" ]; do
+        mark=" "
+        [ "$i" -eq 0 ] && mark="*"
+        pv="${SVC_PROTO[$i]:-http}"
+        bd="${SVC_BODY[$i]}"
+        line=$(printf '  %s %-8s %-6s %-5s %s' "$mark" "${SVC_NAME[$i]}" "${SVC_PORT[$i]}" "$pv" "${SVC_DESC[$i]}")
+        [ -n "$bd" ] && line="${line}  [body: ${bd}]"
+        printf '%s\n' "$line"
+        i=$((i + 1))
+    done
+    if [ -n "$DUP_NAMES" ]; then
+        printf '未生效（同名重复）:%s\n' "$DUP_NAMES"
+    fi
+    printf '用法: %s <Host名> [服务名]\n' "$PROG"
+    exit 0
+fi
+
+# ---------------------------- 选 Host / 选服务 ------------------------------
+# 位序：第 1 个位置参数 = Host，第 2 个 = 服务。为不破坏老用法，
+# 第 1 个位置参数若**不是**已登记的 Host 名，则退化为服务名（老命令 ServPing Git）。
+host_idx=""
+POS1="$opt_service"
+POS2="$opt_service2"
+
+if [ -n "$opt_host" ]; then
+    # -H 显式指定：既可以是已登记的 Host 名，也可以是字面地址
+    if hi=$(host_index "$opt_host"); then
+        host_idx="$hi"
+    else
+        host_idx=""
+        HOST_NAME_TMP="$opt_host"
+        HOST_ADDR_TMP="$opt_host"
+    fi
+    if [ -n "$POS1" ] && host_index "$POS1" >/dev/null 2>&1; then
+        die "-H 与位置参数 '${POS1}' 都指定了 Host，请只留一个"
+    fi
+    [ -n "$POS1" ] && POS2="$POS1"      # -H 之后，第 1 个位置参数让给服务名
+    POS1=""
+fi
+
+if [ -z "$host_idx" ] && [ -z "${HOST_ADDR_TMP:-}" ] && [ -n "$POS1" ]; then
+    if hi=$(host_index "$POS1"); then
+        host_idx="$hi"
+        POS1=""                          # 已消耗为 Host
+    else
+        # 不是 Host 名 ⇒ 当服务名（向后兼容），此时 POS2 不该存在
+        [ -z "$POS2" ] || die "未知 Host '${POS1}'（用 ${PROG} -l 看已登记的 Host）"
+    fi
+fi
+
+if [ -n "${HOST_ADDR_TMP:-}" ]; then
+    HOST="${HOST_ADDR_TMP}"
+    HOST_LABEL="${HOST_NAME_TMP}"
+elif [ -n "$host_idx" ]; then
+    HOST="${HOST_ADDR[$host_idx]}"
+    HOST_LABEL="${HOST_NAME[$host_idx]}"
+else
+    HOST="${HOST_ADDR[0]}"               # 缺省 = 第一条 Host
+    HOST_LABEL="${HOST_NAME[0]}"
+fi
+
+# 服务名的三个来源优先级：-s 显式 > 位置参数（Host 之后的那个）> 缺省第一条
+SVC_SEL="$opt_svc"
+if [ -z "$SVC_SEL" ]; then
+    if [ -n "$POS1" ]; then SVC_SEL="$POS1"
+    elif [ -n "$POS2" ]; then SVC_SEL="$POS2"
+    fi
+fi
+
+if [ -n "$SVC_SEL" ]; then
+    idx=$(svc_index "$SVC_SEL") || {
+        die "未知服务 '${SVC_SEL}'。可用：$(printf '%s ' "${SVC_NAME[@]}")"
+    }
+else
+    idx=0    # 缺省 = 第一条 ServPort
+fi
+
+SERVICE="${SVC_NAME[$idx]}"
+PORT="${opt_port:-${SVC_PORT[$idx]}}"
+DESC="${SVC_DESC[$idx]}"
+EXPBODY="${SVC_BODY[$idx]}"
+[ -n "$DESC" ] || DESC="$SERVICE"
+
+# 探活协议: 命令行 -t 覆盖 > 配置第 5 字段 > 缺省 http
+if [ "$opt_tcp" = "1" ]; then
+    PROTO="tcp"
+else
+    PROTO="${SVC_PROTO[$idx]:-http}"
+fi
+[ -n "$PROTO" ] || PROTO="http"
+[ "$COUNT" -ge 1 ] 2>/dev/null || die "次数必须 >= 1 的整数"
+[ "$TIMEOUT" -gt 0 ] 2>/dev/null || die "超时必须 > 0"
+command -v curl >/dev/null 2>&1 || die "需要 curl"
+
+URL="http://${HOST}:${PORT}/"
+MODE="$PROTO"
+
+# ---------------------------- 主循环 ---------------------------------------
+if [ "$HOST_LABEL" = "$HOST" ]; then
+    printf 'PING %s (%s:%s) [%s]: %s probes\n' "$DESC" "$HOST" "$PORT" "$MODE" "$COUNT"
+else
+    printf 'PING %s (%s %s:%s) [%s]: %s probes\n' "$DESC" "$HOST_LABEL" "$HOST" "$PORT" "$MODE" "$COUNT"
+fi
+printf '# config: %s\n' "$CONF"
+
+rtts=""
+ok_count=0
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+    result=$(probe "$URL" "$EXPBODY" "$PROTO")
+    if [ $? -eq 0 ]; then
+        rtt=$(printf '%s' "$result" | cut -d'|' -f2)
+        size=$(printf '%s' "$result" | cut -d'|' -f3)
+        code=$(printf '%s' "$result" | cut -d'|' -f4)
+        ok_count=$((ok_count + 1))
+        rtts="$rtts $rtt"
+        if [ "$PROTO" = "tcp" ]; then
+            printf 'connected  from %s:%s: tcp_seq=%d time=%s ms\n' "$HOST" "$PORT" "$i" "$rtt"
+        else
+            printf '%s bytes from %s:%s: tcp_seq=%d time=%s ms (HTTP %s)\n' \
+                "$size" "$HOST" "$PORT" "$i" "$rtt" "$code"
+        fi
+    else
+        printf '%s for tcp_seq %d\n' "$result" "$i"
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$COUNT" ] && sleep "$INTERVAL"
+done
+
+# ---------------------------- 统计 -----------------------------------------
+lost=$((COUNT - ok_count))
+loss=$(awk -v l="$lost" -v c="$COUNT" 'BEGIN{printf "%.1f", (c>0? l*100.0/c : 0)}')
+
+printf '\n--- %s:%s %s statistics ---\n' "$HOST" "$PORT" "$PROG"
+printf '%d probes transmitted, %d received, %s%% packet loss\n' "$COUNT" "$ok_count" "$loss"
+
+if [ -n "$rtts" ]; then
+    stats=$(printf '%s\n' $rtts | awk '
+        { v[NR]=$1; s+=$1
+          if (NR==1 || $1<mn) mn=$1
+          if (NR==1 || $1>mx) mx=$1 }
+        END {
+          n=NR; avg=s/n
+          for (i=1;i<=n;i++) { d=v[i]-avg; ss+=d*d }
+          printf "%.2f/%.2f/%.2f/%.2f", mn, avg, mx, sqrt(ss/n)
+        }')
+    printf 'round-trip min/avg/max/stddev = %s ms\n' "$stats"
+else
+    printf 'round-trip min/avg/max/stddev = (no reply)\n'
+fi
+
+if [ "$ok_count" -eq "$COUNT" ]; then
+    printf '%s: OK\n' "$DESC"; exit 0
+elif [ "$ok_count" -eq 0 ]; then
+    printf '%s: FAILED (no reply)\n' "$DESC"; exit 1
+else
+    printf '%s: DEGRADED (%d/%d)\n' "$DESC" "$ok_count" "$COUNT"; exit 1
+fi

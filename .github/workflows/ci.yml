@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: selftest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本信息（macOS 上 /bin/bash 是 3.2，正好验证可移植性）
+        run: |
+          /bin/bash --version | head -1
+          curl --version | head -1
+          python3 --version || true
+
+      - name: 语法检查
+        run: |
+          /bin/bash -n ServPing
+          /bin/bash -n tests/selftest.sh
+          sh -n install.sh
+
+      - name: 自测
+        run: ./tests/selftest.sh

@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# 编辑器
+*.swp
+*~
+.idea/
+.vscode/
+
+# 测试与临时产物
+/tmp/
+*.log
+*.bak
+*.bak.*
