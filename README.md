@@ -1,5 +1,8 @@
 # ServPing
 
+[![CI](https://github.com/bobyin72/servping/actions/workflows/ci.yml/badge.svg)](https://github.com/bobyin72/servping/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > `tcpping` 的通用、人机友好版本 —— 用 TCP / HTTP 探测代替 ICMP，输出格式仿 `ping`。
 
 单文件 bash 脚本，零编译、零依赖（只要 `curl`），支持**多台主机 × 多个服务**的交叉探测。

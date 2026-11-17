@@ -1,5 +1,8 @@
 # ServPing
 
+[![CI](https://github.com/bobyin72/servping/actions/workflows/ci.yml/badge.svg)](https://github.com/bobyin72/servping/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > A user-friendly, generalized `tcpping` — probe services over TCP/HTTP instead of ICMP, with `ping`-style output.
 
 A single bash script. No build step, no dependencies beyond `curl`. Supports probing **many services across many hosts**.
