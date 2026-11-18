@@ -194,6 +194,31 @@ tests/selftest.sh
 
 Without `python3`, group 2 is skipped and group 1 still runs. Exit code 0 means no failures.
 
+## Windows / PowerShell
+
+The `win/` directory holds a **native PowerShell port** — semantically aligned with the bash version (same config model, same curl criteria, same exit-code contract), not a bash wrapper:
+
+| File | Purpose |
+|---|---|
+| `win/ServPing.ps1` | Main script, Windows PowerShell 5.1+ / PowerShell 7+; needs `curl.exe` (shipped with Win10/11 and Server 2016+) |
+| `win/ServPing.cmd` | Double-click launcher: prefers `pwsh.exe`, falls back to `powershell.exe` 5.1, requests elevation once |
+| `win/selftest.ps1` | PowerShell self-test (23 group-1 assertions plus group-2 probing when the environment allows) |
+| `win/DESIGN.md` | Porting semantics cross-reference (internal design doc) |
+
+```powershell
+.\win\ServPing.ps1 -a Host "NAS" 192.168.1.10
+.\win\ServPing.ps1 -a ServPort "Web" 80 "NAS web UI"
+.\win\ServPing.ps1 nas web
+
+# Or double-click win\ServPing.cmd. Config defaults to %APPDATA%\ServPing\servping.conf
+powershell -ExecutionPolicy Bypass -File .\win\selftest.ps1
+```
+
+Config lookup: `-f` > `$env:SERVPING_CONFIG` > `%APPDATA%\ServPing\servping.conf`.
+**Note**: in PowerShell, `curl` is an alias for `Invoke-WebRequest`; the script calls `curl.exe` explicitly — do the same when verifying by hand.
+
+Verified on **Windows PowerShell 5.1** and **PowerShell 7**: all 23 config-semantics assertions pass, and probing behaviour (HTTP 200 / body validation / TCP handshake / exit codes) matches the bash version. CI runs both 5.1 and 7 on `windows-latest`.
+
 ## Known limitations
 
 - `tcp` mode does **not** validate the protocol: an open port serving the wrong thing looks healthy. Use `http` + a body keyword when that matters.

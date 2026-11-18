@@ -200,6 +200,33 @@ tests/selftest.sh
 
 没有 `python3` 时组 2 自动 skip，组 1 仍会跑。退出码 0 = 无失败。
 
+## Windows / PowerShell
+
+`win/` 目录提供**原生 PowerShell 版**，与 bash 版行为逐条对齐（同一配置模型、同一 `curl` 判据、同一退出码契约），不是包一层 bash：
+
+| 文件 | 用途 |
+|---|---|
+| `win/ServPing.ps1` | 主脚本，Windows PowerShell 5.1+ / PowerShell 7+，需 `curl.exe`（Win10/11 与 Server 2016+ 自带） |
+| `win/ServPing.cmd` | 双击入口：优先 `pwsh.exe`，回落 `powershell.exe` 5.1；只请求一次提权 |
+| `win/selftest.ps1` | PowerShell 版自测（23 条组 1 断言 + 组 2 环境允许时的真实探测） |
+| `win/DESIGN.md` | 移植语义对照表（内部设计文档） |
+
+```powershell
+# 直接运行
+.\win\ServPing.ps1 -a Host "NAS" 192.168.1.10
+.\win\ServPing.ps1 -a ServPort "Web" 80 "NAS 管理界面"
+.\win\ServPing.ps1 nas web
+
+# 双击 win\ServPing.cmd 也可；配置默认在 %APPDATA%\ServPing\servping.conf
+# 自测
+powershell -ExecutionPolicy Bypass -File .\win\selftest.ps1
+```
+
+配置查找顺序：`-f` > `$env:SERVPING_CONFIG` > `%APPDATA%\ServPing\servping.conf`。
+**注意**：`curl` 在 PowerShell 里是 `Invoke-WebRequest` 的别名，脚本内部显式调用 `curl.exe`；手工验证时也要写 `curl.exe`。
+
+已在 **Windows PowerShell 5.1 真机**与 **PowerShell 7** 双版本实测：配置语义 23 条全过，探测逻辑（HTTP 200 / 响应体校验 / TCP 握手 / 退出码）行为与 bash 版一致。CI 在 `windows-latest` 上同时跑 5.1 与 7。
+
 ## 已知限制
 
 - `tcp` 模式**不校验协议内容**：端口通但服务挂错，tcp 看不出来。要防这种情况用 `http` + 响应体关键字。

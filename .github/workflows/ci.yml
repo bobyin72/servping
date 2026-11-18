@@ -32,3 +32,41 @@ jobs:
 
       - name: 自测
         run: ./tests/selftest.sh
+
+  test-windows:
+    name: selftest (windows / PowerShell)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本信息（Windows runner 自带 curl.exe 与 PowerShell 5.1/7）
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          curl.exe --version | Select-Object -First 1
+
+      - name: 语法检查（含 UTF-8 BOM 校验）
+        shell: pwsh
+        run: |
+          foreach ($f in @('win/ServPing.ps1', 'win/selftest.ps1')) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs.Count -gt 0) { throw "$f 语法错误 $($errs.Count) 处" }
+            $b = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
+            if (-not ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
+              throw "$f 缺 UTF-8 BOM（PS 5.1 会按 GBK 解码导致中文乱码/语法错）"
+            }
+            Write-Output "$f : AST 0 error, BOM ok"
+          }
+
+      - name: 自测（PowerShell 5.1）
+        shell: powershell
+        run: .\win\selftest.ps1
+
+      - name: 自测（PowerShell 7）
+        shell: pwsh
+        run: .\win\selftest.ps1
