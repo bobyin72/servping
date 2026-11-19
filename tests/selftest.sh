@@ -162,6 +162,31 @@ marks=$(printf '%s\n' "$out" | grep -c '^  \* ')
 if [ "$marks" = "2" ]; then ok '-l 里缺省标记恰好 2 个（Host + 服务）'
 else bad '-l 里缺省标记数量' "期望 2，实际 $marks"; fi
 
+# ---- 端口范围 1-65535（大奔 issue #2 的配套校验）----
+cfg "$WORK/pr0.conf" 'Host 127.0.0.1
+ServPort "Bad" 0 "x"
+'
+out=$("$SUT" -f "$WORK/pr0.conf" -l 2>&1); rc=$?
+expect_rc '配置端口 0 -> rc 2' 2 "$rc"
+expect_has '配置端口 0 报范围' "$out" '1-65535'
+
+cfg "$WORK/pr65536.conf" 'Host 127.0.0.1
+ServPort "Bad" 65536 "x"
+'
+out=$("$SUT" -f "$WORK/pr65536.conf" -l 2>&1); rc=$?
+expect_rc '配置端口 65536 -> rc 2' 2 "$rc"
+
+out=$("$SUT" -f "$WORK/a.conf" -a ServPort "Bad" 65536 >/dev/null 2>&1); rc=$?
+expect_rc '-a 端口越界 -> rc 2' 2 "$rc"
+
+# ---- 版本单一口径闸门（大奔 issue #3）----
+out=$("$SUT" -V 2>&1)
+expect_has '-V 自报 3.2.0' "$out" 'ServPing 3.2.0'
+expect_file_has 'bash 版本常量 = 3.2.0' "$SUT" 'VERSION="3.2.0"'
+expect_file_has 'PS 版本常量 = 3.2.0' "$HERE/../win/ServPing.ps1" '$script:VERSION = '"'"'3.2.0'"'"''
+expect_file_has 'PS 头部注释 = v3.2.0' "$HERE/../win/ServPing.ps1" '对应 bash 版 v3.2.0'
+expect_hasnt 'bash 无残留 3.0.0 版本常量' "$out" 'ServPing 3.0.0'
+
 # ===========================================================================
 # 组 2：真实探测
 # ===========================================================================
@@ -208,6 +233,71 @@ ServPort \"Web\" $P_HTTP \"网页\" http
 
         out=$("$SUT" -f "$WORK/h.conf" -p "$P_HTTP" -s Web -c 1 -W 1 2>&1)
         expect_has '-p 覆盖端口生效' "$out" "127.0.0.1:$P_HTTP"
+
+        # ---- 302 重定向：健康，但必须单独标 REDIRECT，且绝不算丢包 ----
+        cat > "$WORK/redir.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location', '/target')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PY
+        P_RED=$(free_port)
+        python3 "$WORK/redir.py" "$P_RED" >/dev/null 2>&1 &
+        SRV_PIDS="$SRV_PIDS $!"
+        if wait_port "$P_RED" 50; then
+            cfg "$WORK/r.conf" "Host \"Loop\" 127.0.0.1
+ServPort \"Redir\" $P_RED \"重定向\" http
+"
+            out=$("$SUT" -f "$WORK/r.conf" Loop Redir -c 1 -W 2 2>&1); rc=$?
+            expect_rc 'HTTP 302 -> rc 0' 0 "$rc"
+            expect_has '302 输出 redirect from' "$out" 'redirect from'
+            expect_has '302 显示 HTTP 302' "$out" '(HTTP 302)'
+            expect_has '302 不算丢包' "$out" '0.0% packet loss'
+            expect_has '302 received=1' "$out" '1 probes transmitted, 1 received'
+            expect_hasnt '302 不报 no reply' "$out" 'no reply'
+            expect_has '302 结论 OK' "$out" '重定向: OK'
+        else
+            skip 'HTTP 302 探测' '本地重定向服务没起来'
+        fi
+
+        # ---- 500：失败，但响应已收到，不能报 no reply / 丢包 ----
+        cat > "$WORK/err500.py" <<'PY'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(500)
+        self.send_header('Content-Length', '2')
+        self.end_headers()
+        self.wfile.write(b'ER')
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PY
+        P_500=$(free_port)
+        python3 "$WORK/err500.py" "$P_500" >/dev/null 2>&1 &
+        SRV_PIDS="$SRV_PIDS $!"
+        if wait_port "$P_500" 50; then
+            cfg "$WORK/e500.conf" "Host \"Loop\" 127.0.0.1
+ServPort \"Fail500\" $P_500 \"错误500\" http
+"
+            out=$("$SUT" -f "$WORK/e500.conf" Loop Fail500 -c 1 -W 2 2>&1); rc=$?
+            expect_rc 'HTTP 500 -> rc 1' 1 "$rc"
+            expect_has '500 报真实 HTTP 原因' "$out" 'HTTP 500 unexpected (expect 2xx/3xx)'
+            expect_has '500 不算丢包' "$out" '0.0% packet loss'
+            expect_has '500 received=1' "$out" '1 probes transmitted, 1 received'
+            expect_hasnt '500 不报 no reply' "$out" 'no reply'
+            expect_has '500 结论含状态码' "$out" 'FAILED (HTTP 500 unexpected'
+        else
+            skip 'HTTP 500 探测' '本地错误服务没起来'
+        fi
 
         # 响应体关键字：命中 / 未命中
         cfg "$WORK/b1.conf" "Host 127.0.0.1

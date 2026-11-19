@@ -94,6 +94,16 @@ while True:
     Start-Sleep -Milliseconds 700
     return $p
 }
+function Start-Py([string]$Script, [string]$Arg1) {
+    if (-not $script:PyOk) { return $null }
+    $tag = [System.IO.Path]::GetFileNameWithoutExtension($Script)
+    $p = Start-Process -FilePath 'python3' -ArgumentList @($Script, $Arg1) -PassThru `
+        -RedirectStandardOutput (Join-Path $WORK ($tag + '.out')) `
+        -RedirectStandardError (Join-Path $WORK ($tag + '.err'))
+    $script:Servers.Add($p)
+    Start-Sleep -Milliseconds 700
+    return $p
+}
 
 Write-Output "ServPing.ps1 自测 —— $SUT"
 Write-Output "工作目录: $WORK`n"
@@ -180,11 +190,46 @@ $r = Run-Sut (Join-Path $WORK 'bad.conf') @('-l')
 Expect-Rc '坏 Host 不让位 -> rc 2' 2 $r.rc
 Expect-Has '坏行带行号' $r.out '第 1 行'
 
+# ---- 端口范围 1-65535 + 脚本化整数端口（大奔 issue #2）----
+$intCfg = Join-Path $WORK 'int.conf'
+Cfg $intCfg "Host 127.0.0.1`n"
+$intArgs = @('-f', $intCfg, '-a', 'ServPort', 'IntTest', 3000, 'desc', 'http')
+$out = & $PW -NoProfile -File $SUT @intArgs 2>&1 | Out-String
+$rc = $LASTEXITCODE
+Expect-Rc '脚本化整数端口不再崩溃 -> rc 0' 0 $rc
+Expect-Has '整数端口写入成功' $out '已追加'
+$written = [System.IO.File]::ReadAllText($intCfg)
+Expect-Has '整数端口写入配置' $written 'ServPort "IntTest" 3000 "desc"'
+
+$pr0 = Join-Path $WORK 'pr0.conf'
+Cfg $pr0 "Host 127.0.0.1`nServPort `"Bad`" 0 `"x`"`n"
+$r = Run-Sut $pr0 @('-l')
+Expect-Rc '配置端口 0 -> rc 2' 2 $r.rc
+Expect-Has '配置端口 0 报范围' $r.out '1-65535'
+
+$prMax = Join-Path $WORK 'pr65536.conf'
+Cfg $prMax "Host 127.0.0.1`nServPort `"Bad`" 65536 `"x`"`n"
+$r = Run-Sut $prMax @('-l')
+Expect-Rc '配置端口 65536 -> rc 2' 2 $r.rc
+
+$r = Run-Sut $intCfg @('-a', 'ServPort', 'Bad', 65536, 'x')
+Expect-Rc '-a 端口越界 -> rc 2' 2 $r.rc
+
 # -V / -h（PS 专属坑：-h 曾被 -H 前缀匹配吃掉）
 $r = Run-Sut (Join-Path $WORK 'e.conf') @('-V')
-Expect-Has '-V 版本' $r.out 'ServPing 3.0.0'
+Expect-Has '-V 版本' $r.out 'ServPing 3.2.0'
 $r = Run-Sut (Join-Path $WORK 'e.conf') @('-h')
 Expect-Has '-h 帮助' $r.out '-a TYPE'
+
+# ---- 版本单一口径闸门（大奔 issue #3）----
+$psSrc = [System.IO.File]::ReadAllText($SUT)
+$bashSrc = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\ServPing'))
+$psVerLine = '$script:VERSION = ''3.2.0'''
+$psOldVerLine = '$script:VERSION = ''3.0.0'''
+Expect-Has 'PS 版本常量 = 3.2.0' $psSrc $psVerLine
+Expect-Has 'bash 版本常量 = 3.2.0' $bashSrc 'VERSION="3.2.0"'
+Expect-Has 'PS 头部注释 = v3.2.0' $psSrc '对应 bash 版 v3.2.0'
+Expect-Hasnt 'PS 无残留 3.0.0 版本常量' $psSrc $psOldVerLine
 
 # ===========================================================================
 # 组 2：真实探测（python3 起本地监听）
@@ -192,14 +237,14 @@ Expect-Has '-h 帮助' $r.out '-a TYPE'
 Write-Output "`n[组 2] 真实探测（本机回环）"
 # ★不能只看 Get-Command：Windows Store 的 python3.exe 是占位符（执行无任何输出），
 #   会让组 2 全部假失败。必须实测它能执行代码才算可用。
-$pyOk = $false
+$script:PyOk = $false
 if (Get-Command python3 -ErrorAction SilentlyContinue) {
     try {
         $probe = & python3 -c 'print(12345)' 2>$null
-        if (("$probe").Trim() -eq '12345') { $pyOk = $true }
+        if (("$probe").Trim() -eq '12345') { $script:PyOk = $true }
     } catch {}
 }
-if (-not $pyOk) {
+if (-not $script:PyOk) {
     Sk '组 2 全部' '无可用 python3（Windows Store 占位符不算）'
 } else {
     $www = Join-Path $WORK 'www'
@@ -216,6 +261,65 @@ ServPort "Web" $pHttp "本地HTTP" http "Gitea-OK"
     Expect-Rc 'HTTP 200 + body 命中 -> rc 0' 0 $r.rc
     Expect-Has 'HTTP 输出含 HTTP 200' $r.out '(HTTP 200)'
     Expect-Has 'HTTP 统计 0% 丢包' $r.out '0.0% packet loss'
+
+    # ---- 302 重定向：健康，但必须单独标 REDIRECT，且绝不算丢包 ----
+    $redirPy = Join-Path $WORK 'redir.py'
+    Cfg $redirPy @'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location', '/target')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+'@
+    $pRed = Free-Port
+    $null = Start-Py $redirPy "$pRed"
+    Cfg (Join-Path $WORK 'r.conf') @"
+Host "Loop" 127.0.0.1
+ServPort "Redir" $pRed "重定向" http
+"@
+    $r = Run-Sut (Join-Path $WORK 'r.conf') @('Loop','Redir','-c','1','-W','2')
+    Expect-Rc 'HTTP 302 -> rc 0' 0 $r.rc
+    Expect-Has '302 输出 redirect from' $r.out 'redirect from'
+    Expect-Has '302 显示 HTTP 302' $r.out '(HTTP 302)'
+    Expect-Has '302 不算丢包' $r.out '0.0% packet loss'
+    Expect-Has '302 received=1' $r.out '1 probes transmitted, 1 received'
+    Expect-Hasnt '302 不报 no reply' $r.out 'no reply'
+    Expect-Has '302 结论 OK' $r.out '重定向: OK'
+
+    # ---- 500：失败，但响应已收到，不能报 no reply / 丢包 ----
+    $errPy = Join-Path $WORK 'err500.py'
+    Cfg $errPy @'
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(500)
+        self.send_header('Content-Length', '2')
+        self.end_headers()
+        self.wfile.write(b'ER')
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+'@
+    $p500 = Free-Port
+    $null = Start-Py $errPy "$p500"
+    Cfg (Join-Path $WORK 'e500.conf') @"
+Host "Loop" 127.0.0.1
+ServPort "Fail500" $p500 "错误500" http
+"@
+    $r = Run-Sut (Join-Path $WORK 'e500.conf') @('Loop','Fail500','-c','1','-W','2')
+    Expect-Rc 'HTTP 500 -> rc 1' 1 $r.rc
+    Expect-Has '500 报真实 HTTP 原因' $r.out 'HTTP 500 unexpected (expect 2xx/3xx)'
+    Expect-Has '500 不算丢包' $r.out '0.0% packet loss'
+    Expect-Has '500 received=1' $r.out '1 probes transmitted, 1 received'
+    Expect-Hasnt '500 不报 no reply' $r.out 'no reply'
+    Expect-Has '500 结论含状态码' $r.out 'FAILED (HTTP 500 unexpected'
 
     # body 不匹配必须失败（反向配对）
     Cfg (Join-Path $WORK 'b.conf') @"

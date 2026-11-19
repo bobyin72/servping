@@ -1,13 +1,13 @@
 # ServPing Windows 版设计对照表（内部设计文档）
 
-> bash 版源码权威：`../ServPing`（v3.0.0，731 行）
+> bash 版源码权威：`../ServPing`（v3.2.0）
 > 本文件是移植依据，不是用户文档。任何语义分歧以 bash 版为准。
 
 ## 1. 版本与常量
 
 | bash | PowerShell |
 |---|---|
-| `VERSION="3.0.0"` | `$script:VERSION = '3.0.0'` |
+| `VERSION="3.2.0"` | `$script:VERSION = '3.2.0'` |
 | `PROG="ServPing"` | `$script:PROG = 'ServPing'` |
 | `DEF_FILE="/usr/local/etc/servping.conf"` | `Join-Path $env:APPDATA 'ServPing\servping.conf'` |
 | `DEF_COUNT=4 / DEF_INTERVAL=1 / DEF_TIMEOUT=5` | 同值 |
@@ -38,7 +38,7 @@ Tokenize-Line(line) -> string[]
 ### 加载语义（`Load-Conf`，幂等）
 - 每次调用先清空 7 个数组与计数（bash 版修过的动态作用域 bug 教训：所有函数内变量必须先声明为 local/局部）。
 - `Host` 两写法：字段数≥3 → 名称=第2、地址=第3；字段数==2 → 名称=地址=第2；否则 die 带行号，提示两种正确写法。
-- `ServPort` 字段：1=名 2=端口 3=描述 4=proto 5=body；字段数<3 die；端口必须纯数字（正则 `^\d+$`）；proto 小写化，`http|tcp` 之外 die，且旧版 v1.x 迁移提示要逐字保留（含可抄的修正行）。
+- `ServPort` 字段：1=名 2=端口 3=描述 4=proto 5=body；字段数<3 die；端口必须纯数字（正则 `^\d+$`）且在 **1-65535**；proto 小写化，`http|tcp` 之外 die，且旧版 v1.x 迁移提示要逐字保留（含可抄的修正行）。
 - 同名只认第一条：重复项记入 `$script:DUP_HOSTS/$DUP_NAMES`，**保留在文件里但不进数组**。
 - **坏行一律 die 退出码 2，绝不跳过**（跳过 = 缺省位被后面的记录顶替 = 静默走偏）。
 
@@ -64,13 +64,14 @@ $rc = $LASTEXITCODE
 ```
 - `-w` 失败时照样输出，先取 `$LASTEXITCODE` 再解析四段（`time_total`/`time_connect`/`size_download`）。
 - tcp 判据：`time_connect != '0.000000'` → OK（即使 rc=52/56/28）；否则按 rc 映射错误文案（0/28/7/6/其他）。
-- http 判据：rc!=0 → 按 rc 映射（28/7/6/35/其他）；code!='200' → `HTTP xxx unexpected (expect 200)`；有 body 关键字时用 `Select-String -SimpleMatch -Quiet`（对齐 grep -qF）校验。
-- 返回字符串 `OK|time|size|code` 或错误文本，调用方用 rc 判定——与 bash 完全同构。
+- http 判据：**先判 rc!=0 → `NOREPLY`**（按 rc 映射 28/7/6/35/其他），这才是唯一算丢包的情形；拿到响应后 2xx→`OK`、3xx→`REDIRECT`（健康）、4xx/5xx→`HTTPERR`（失败但已收到）；有 body 关键字时用 `Select-String -SimpleMatch -Quiet`（对齐 grep -qF）校验，不匹配也归 `HTTPERR`。
+- 返回 Hashtable `{ Ok; Status; Rtt; Size; Code; Text }`，`Status ∈ OK|REDIRECT|HTTPERR|NOREPLY`；bash 侧用等价的 `STATUS|...` 字符串，调用方不再解析中间文案猜语义——与 bash 完全同构。
 - `to_ms`：`$v * 1000` 格式化 `F2`，与 awk `printf "%.2f"` 对齐（注意 PowerShell 用当前区域小数点，必要时 `[CultureInfo]::InvariantCulture`）。
 
 ## 5. 选项解析
 
 逐字对齐：`-a/--add` `-rm/--remove` `-c` `-i` `-W` `-H` `-p` `-s` `-f` `-t` `-l` `-V` `-h` `--`。
+- ★入口必须 `$av = @($args | ForEach-Object { [string]$_ })`：脚本化调用传未加引号的整数端口时，`$args` 保留 `[int]`，直接 `.StartsWith()` 会异常逃逸且 `$LASTEXITCODE` 不设置（大奔 issue #2）。
 - `-a Host` 收 1~2 个参数；`-a ServPort` 收 2~5 个（第3位若为 http/tcp 且第4位空 → 让位给 proto）；这些"连续非选项参数"逻辑必须一致。
 - 位置参数最多 2 个；`-H` 与位置 Host 同时给 → die。
 - 第 1 个位置参数先按 Host 名解析，解析不到才当服务名（保老用法 `ServPing Git`）。
@@ -94,12 +95,12 @@ $rc = $LASTEXITCODE
 - PING 头两分支（具名/未具名）逐字对齐。
 - 每次 `Invoke-Probe`，成功解析 `OK|rtt|size|code` 并打印；失败直接打印错误文本。
 - `sleep $INTERVAL` → `Start-Sleep -Seconds $INTERVAL`。
-- 统计：`awk` 算丢包率与 min/avg/max/stddev → PowerShell 用 `[math]::Sqrt` 与 `Measure-Object`，格式 `F1`/`F2` 对齐。
-- 结论行与退出码：`OK→0`、`FAILED (no reply)→1`、`DEGRADED (n/m)→1`。
+- 统计：`received` = `OK` + `REDIRECT` + `HTTPERR`（收到过响应），`lost = COUNT - received`；只有 `NOREPLY` 才计丢包。`awk` 算丢包率与 min/avg/max/stddev → PowerShell 用 `[math]::Sqrt` 与 `Measure-Object`，格式 `F1`/`F2` 对齐。
+- 结论行与退出码：全 `OK/REDIRECT`→`OK` rc0；`received=0`→`FAILED (no reply)` rc1；`received>0` 但零成功→`FAILED (<HTTP 原因>)` rc1；部分成功→`DEGRADED (n/m)` rc1。
 
 ## 9. 自测（tests/selftest.ps1）
 
-移植 bash 版 40 条断言。**保留负对照原则**：两个 Host 必须在被测维度（地址）上取值不同（如 127.0.0.1 vs 127.0.0.2），否则断言恒真——这是 2026-11-17 抓到过真 bug 的判据，不能丢。
+移植 bash 版断言（bash 62 条 / PowerShell 56 条，随平台可用性 skip 组 2）。**保留负对照原则**：两个 Host 必须在被测维度（地址）上取值不同（如 127.0.0.1 vs 127.0.0.2），否则断言恒真——这是 2026-11-17 抓到过真 bug 的判据，不能丢。新增三条回归：脚本化整数端口、HTTP 302 不算丢包、HTTP 500 不报 no reply。
 
 ## 10. CI
 

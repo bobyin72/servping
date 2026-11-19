@@ -1,8 +1,8 @@
 ﻿<#
 ===============================================================================
- ServPing.ps1 — Windows PowerShell 版（对应 bash 版 v3.0.0）
+ ServPing.ps1 — Windows PowerShell 版（对应 bash 版 v3.2.0）
 ===============================================================================
- Version    : 3.0.0
+ Version    : 3.2.0
  Requires   : Windows PowerShell 5.1+ 或 PowerShell 7+；curl.exe
  Encoding   : UTF-8 with BOM（请保持，否则中文注释乱码）
  -------------------------------------------------------------------------------
@@ -53,6 +53,8 @@
 
  ★口径: http 的 time= 是 HTTP 全链路；tcp 的 time= 只取 curl 的
    %{time_connect}（纯 TCP 握手），两种 time 不可横向比较。
+ ★状态码: http 的 2xx/3xx 算健康（3xx 输出 REDIRECT）；4xx/5xx 判失败，
+   但响应已收到 ⇒ received 计数、丢包为 0。只有拿不到响应才算丢包。
 ===============================================================================
 #>
 
@@ -61,7 +63,7 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:VERSION = '3.0.0'
+$script:VERSION = '3.2.0'
 $script:PROG = 'ServPing'
 $script:DEF_COUNT = 4
 $script:DEF_INTERVAL = 1
@@ -126,7 +128,9 @@ $wantVersion = 0
 $wantHelp = 0
 $Positional = New-Object System.Collections.Generic.List[string]
 
-$av = @($args)
+# ★入口统一字符串化：脚本化调用传 3000 时 $args 元素是 [System.Int32]，
+#   直接 .StartsWith() 会抛异常且 $LASTEXITCODE 不设置（大奔 issue #2）。
+$av = @($args | ForEach-Object { [string]$_ })
 $i = 0
 while ($i -lt $av.Count) {
     $t = $av[$i]
@@ -264,6 +268,7 @@ function Load-Conf {
                 if ($f.Count -ge 5) { $pv = $f[4] }
                 if ($f.Count -ge 6) { $bd = $f[5] }
                 if ($pt -notmatch '^\d+$') { Die "配置第 ${ln} 行：ServPort `"${nm}`" 的端口不是数字：'${pt}'" }
+                if ([int]$pt -lt 1 -or [int]$pt -gt 65535) { Die "配置第 ${ln} 行：ServPort `"${nm}`" 的端口超出 1-65535：'${pt}'" }
                 if ([string]::IsNullOrEmpty($pv)) { $pv = 'http' }
                 $pv_raw = $pv
                 $pv = $pv.ToLowerInvariant()
@@ -315,6 +320,7 @@ function Add-Entry {
             $pv = if ($Items.Count -ge 4) { $Items[3] } else { '' }
             $bd = if ($Items.Count -ge 5) { $Items[4] } else { '' }
             if ($pt -notmatch '^\d+$') { Die "端口必须是数字：${pt}" }
+            if ([int]$pt -lt 1 -or [int]$pt -gt 65535) { Die "端口必须是 1-65535 的整数：${pt}" }
             if ([string]::IsNullOrEmpty($pv) -and -not [string]::IsNullOrEmpty($ds)) {
                 if ($ds.ToLowerInvariant() -in @('http', 'tcp')) { $pv = $ds; $ds = '' }
             }
@@ -386,17 +392,33 @@ function Invoke-Probe {
 
         if ($Proto -eq 'tcp') {
             if ($t_conn -ne '0.000000' -and -not [string]::IsNullOrEmpty($t_conn)) {
-                return @{ Ok = $true; Text = ('OK|{0}|{1}|{2}' -f (To-Ms $t_conn), $size, $code) }
+                $rtt = To-Ms $t_conn
+                return @{ Ok = $true; Status = 'OK'; Rtt = $rtt; Size = $size; Code = $code; Text = ('OK|{0}|{1}|{2}' -f $rtt, $size, $code) }
             }
-            return @{ Ok = $false; Text = (Probe-ErrText $rc 'tcp') }
+            return @{ Ok = $false; Status = 'NOREPLY'; Rtt = '0.00'; Size = '0'; Code = $code; Text = (Probe-ErrText $rc 'tcp') }
         }
-        if ($rc -ne 0) { return @{ Ok = $false; Text = (Probe-ErrText $rc 'http') } }
-        if ($code -ne '200') { return @{ Ok = $false; Text = ('HTTP {0} unexpected (expect 200)' -f $code) } }
+
+        # 先判「有没有拿到响应」：rc!=0 才算 no reply / 丢包。
+        if ($rc -ne 0) {
+            return @{ Ok = $false; Status = 'NOREPLY'; Rtt = '0.00'; Size = '0'; Code = $code; Text = (Probe-ErrText $rc 'http') }
+        }
+
+        $rtt = To-Ms $t_total
+        if ($code -match '^2\d\d$') { $status = 'OK' }
+        elseif ($code -match '^3\d\d$') { $status = 'REDIRECT' }
+        else {
+            $reason = 'HTTP {0} unexpected (expect 2xx/3xx)' -f $code
+            return @{ Ok = $false; Status = 'HTTPERR'; Rtt = $rtt; Size = $size; Code = $code; Text = $reason }
+        }
+
         if (-not [string]::IsNullOrEmpty($ExpectBody)) {
             $found = Select-String -LiteralPath $body -SimpleMatch -Quiet -Pattern $ExpectBody
-            if (-not $found) { return @{ Ok = $false; Text = ('body mismatch (expect "{0}")' -f $ExpectBody) } }
+            if (-not $found) {
+                $reason = 'body mismatch (expect "{0}")' -f $ExpectBody
+                return @{ Ok = $false; Status = 'HTTPERR'; Rtt = $rtt; Size = $size; Code = $code; Text = $reason }
+            }
         }
-        return @{ Ok = $true; Text = ('OK|{0}|{1}|{2}' -f (To-Ms $t_total), $size, $code) }
+        return @{ Ok = $true; Status = $status; Rtt = $rtt; Size = $size; Code = $code; Text = ('OK|{0}|{1}|{2}' -f $rtt, $size, $code) }
     } finally {
         Remove-Item -LiteralPath $body -Force -ErrorAction SilentlyContinue
     }
@@ -508,29 +530,45 @@ Write-Output ('# config: {0}' -f $CONF)
 
 $rtts = New-Object System.Collections.Generic.List[double]
 $ok = 0
+$recv = 0
+$lastHttpReason = ''
 for ($k = 0; $k -lt $COUNT; $k++) {
     $r = Invoke-Probe -Url $URL -ExpectBody $EXPBODY -Proto $PROTO -Sec $TIMEOUT
-    if ($r.Ok) {
-        $parts = @($r.Text -split '\|')
-        $rtt = [double]$parts[1]; $size = $parts[2]; $code = $parts[3]
+    $st = [string]$r.Status
+    if ([string]::Equals($st, 'OK', [StringComparison]::Ordinal) -or
+        [string]::Equals($st, 'REDIRECT', [StringComparison]::Ordinal)) {
+        $recv++
         $ok++
+        $rtt = [double]$r.Rtt
         [void]$rtts.Add($rtt)
-        if ($PROTO -eq 'tcp') {
-            Write-Output ('connected  from {0}:{1}: tcp_seq={2} time={3} ms' -f $TargetHost, $PORT, $k, $rtt.ToString('F2'))
+        if ([string]::Equals($st, 'REDIRECT', [StringComparison]::Ordinal)) {
+            Write-Output ('redirect from {0}:{1}: tcp_seq={2} time={3} ms (HTTP {4})' -f `
+                $TargetHost, $PORT, $k, $r.Rtt, $r.Code)
+        } elseif ($PROTO -eq 'tcp') {
+            Write-Output ('connected  from {0}:{1}: tcp_seq={2} time={3} ms' -f $TargetHost, $PORT, $k, $r.Rtt)
         } else {
-            Write-Output ('{0} bytes from {1}:{2}: tcp_seq={3} time={4} ms (HTTP {5})' -f $size, $TargetHost, $PORT, $k, $rtt.ToString('F2'), $code)
+            Write-Output ('{0} bytes from {1}:{2}: tcp_seq={3} time={4} ms (HTTP {5})' -f `
+                $r.Size, $TargetHost, $PORT, $k, $r.Rtt, $r.Code)
         }
-    } else {
+    }
+    elseif ([string]::Equals($st, 'HTTPERR', [StringComparison]::Ordinal)) {
+        $recv++
+        [void]$rtts.Add([double]$r.Rtt)
+        $lastHttpReason = [string]$r.Text
+        Write-Output ('{0} for tcp_seq {1}' -f $r.Text, $k)
+    }
+    else {
         Write-Output ('{0} for tcp_seq {1}' -f $r.Text, $k)
     }
     if ($k -lt ($COUNT - 1)) { Start-Sleep -Milliseconds ([int]($INTERVAL * 1000)) }
 }
 
-$lost = $COUNT - $ok
+# lost = 完全没收到响应的次数，不再把 HTTP 状态码失败算成丢包。
+$lost = $COUNT - $recv
 $loss = if ($COUNT -gt 0) { ($lost * 100.0 / $COUNT).ToString('F1', [Globalization.CultureInfo]::InvariantCulture) } else { '0.0' }
 Write-Output ''
 Write-Output ('--- {0}:{1} {2} statistics ---' -f $TargetHost, $PORT, $script:PROG)
-Write-Output ('{0} probes transmitted, {1} received, {2}% packet loss' -f $COUNT, $ok, $loss)
+Write-Output ('{0} probes transmitted, {1} received, {2}% packet loss' -f $COUNT, $recv, $loss)
 if ($rtts.Count -gt 0) {
     $stats = $rtts | Measure-Object -Minimum -Maximum -Average
     $avg = [double]$stats.Average
@@ -548,5 +586,9 @@ if ($rtts.Count -gt 0) {
 }
 
 if ($ok -eq $COUNT) { Write-Output ('{0}: OK' -f $DESC); exit 0 }
-elseif ($ok -eq 0) { Write-Output ('{0}: FAILED (no reply)' -f $DESC); exit 1 }
+elseif ($recv -eq 0) { Write-Output ('{0}: FAILED (no reply)' -f $DESC); exit 1 }
+elseif ($ok -eq 0) {
+    if ([string]::IsNullOrEmpty($lastHttpReason)) { $lastHttpReason = 'HTTP failure' }
+    Write-Output ('{0}: FAILED ({1})' -f $DESC, $lastHttpReason); exit 1
+}
 else { Write-Output ('{0}: DEGRADED ({1}/{2})' -f $DESC, $ok, $COUNT); exit 1 }

@@ -32,7 +32,8 @@
 # ★字段顺序（ServPort 第 5 位起可省略）:
 #   1=ServPort 关键字  2=名称  3=端口  4=描述  5=proto  6=响应体关键字
 #   proto: http（缺省）| tcp
-#     http — 校验 HTTP 200（有第 6 字段时再校验响应体包含该关键字）
+#     http — 校验 HTTP 2xx/3xx（3xx 视作 REDIRECT 健康；有第 6 字段时再校验响应体）
+#            4xx/5xx 判失败，但响应已收到 ⇒ 计入 received，不计入丢包
 #     tcp  — 只判 TCP 三次握手是否建立，可用于 SSH / MySQL 等非 HTTP 服务
 #
 # ★★唯一原则：一律取第一条
@@ -46,7 +47,7 @@
 #   Host —— 此时用 -H 指 Host、位置参数留给服务，或用 -s 显式指定服务。
 #
 # ★配置写坏 = 退出码 2，不静默跳过（含：Host 缺地址/缺名称、ServPort 缺字段、
-#   端口非数字、proto 非 http|tcp）。报错会带**行号**。
+#   端口非数字或超出 1-65535、proto 非 http|tcp）。报错会带**行号**。
 #
 # ★v2.x 不兼容提示:
 #   · v1.x 第 5 字段是"响应体关键字"，本版第 5 字段是 proto（老配置会报错并给出修正行）
@@ -82,10 +83,14 @@
 #   成功返回）。服务不响应 HTTP 时 curl 会报 52/56/28 等，但握手本身是通的，
 #   仍判成功 —— 这正是 tcp 模式要的语义。
 #
+# ★统计口径: received = 收到任何 HTTP 响应（含 3xx/4xx/5xx）或 TCP 握手成功；
+#   packet loss = 完全没拿到响应。HTTP 状态码不合预期只影响成功判定，
+#   绝不再误报成 100% 丢包 / no reply。
+#
 # 兼容性: macOS 自带 bash 3.2 / Linux bash 均可（不依赖关联数组、不依赖 date +%N）。
 # ============================================================================
 
-VERSION="3.0.0"
+VERSION="3.2.0"
 PROG="ServPing"
 
 DEF_FILE="/usr/local/etc/servping.conf"
@@ -243,6 +248,9 @@ load_conf() {
                     ''|*[!0-9]*)
                         die "配置第 ${ln} 行：ServPort \"${nm}\" 的端口不是数字：'${pt}'" ;;
                 esac
+                if [ "$pt" -lt 1 ] || [ "$pt" -gt 65535 ]; then
+                    die "配置第 ${ln} 行：ServPort \"${nm}\" 的端口超出 1-65535：'${pt}'"
+                fi
                 if [ -z "$pv" ]; then pv="http"; fi
                 pv_raw="$pv"                      # 保留原样，仅用于报错回显
                 pv=$(printf '%s' "$pv" | tr 'A-Z' 'a-z')
@@ -314,6 +322,9 @@ do_add() {
             case "$pt" in
                 ''|*[!0-9]*) die "端口必须是数字：${pt}" ;;
             esac
+            if [ "$pt" -lt 1 ] || [ "$pt" -gt 65535 ]; then
+                die "端口必须是 1-65535 的整数：${pt}"
+            fi
             # 兼容：省略描述直接给 proto（如 ... 22 tcp）时，把描述位让给 proto
             if [ -z "$pv" ] && [ -n "$ds" ]; then
                 case "$(printf '%s' "$ds" | tr 'A-Z' 'a-z')" in
@@ -371,7 +382,7 @@ do_add() {
 # ---------------------------------------------------------------------------
 probe() {
     local url="$1" expect_body="$2" proto="$3"
-    local body rc w code t_total t_conn size
+    local body rc w code t_total t_conn size status rtt reason
 
     body=$(mktemp "${TMPDIR:-/tmp}/servping.XXXXXX") || die "无法创建临时文件"
 
@@ -400,44 +411,54 @@ probe() {
         fi
         rm -f "$body"
         case $rc in
-            0)  printf 'tcp connect not established' ;;
-            28) printf 'Connection timeout' ;;
-            7)  printf 'Connection refused' ;;
-            6)  printf 'Could not resolve host' ;;
-            *)  printf 'curl error %d' "$rc" ;;
+            0)  reason='tcp connect not established' ;;
+            28) reason='Connection timeout' ;;
+            7)  reason='Connection refused' ;;
+            6)  reason='Could not resolve host' ;;
+            *)  reason="curl error ${rc}" ;;
         esac
+        printf 'NOREPLY|%s' "$reason"
         return 1
     fi
 
     # ---- proto=http：整链路 + 状态码 + 可选响应体 ----
+    # 先判「有没有拿到响应」：rc!=0 才算 no reply / 丢包。
     if [ $rc -ne 0 ]; then
         rm -f "$body"
         case $rc in
-            28) printf 'Request timeout' ;;
-            7)  printf 'Connection refused' ;;
-            6)  printf 'Could not resolve host' ;;
-            35) printf 'TLS handshake failed' ;;
-            *)  printf 'curl error %d' "$rc" ;;
+            28) reason='Request timeout' ;;
+            7)  reason='Connection refused' ;;
+            6)  reason='Could not resolve host' ;;
+            35) reason='TLS handshake failed' ;;
+            *)  reason="curl error ${rc}" ;;
         esac
+        printf 'NOREPLY|%s' "$reason"
         return 1
     fi
 
-    if [ "$code" != "200" ]; then
-        rm -f "$body"
-        printf 'HTTP %s unexpected (expect 200)' "$code"
-        return 1
-    fi
+    rtt=$(to_ms "$t_total")
+    case "$code" in
+        2??) status='OK' ;;
+        3??) status='REDIRECT' ;;
+        *)
+            rm -f "$body"
+            printf 'HTTPERR|%s|%s|%s|HTTP %s unexpected (expect 2xx/3xx)' \
+                "$rtt" "${size:-0}" "$code" "$code"
+            return 1
+            ;;
+    esac
 
     if [ -n "$expect_body" ]; then
         if ! grep -qF -- "$expect_body" "$body" 2>/dev/null; then
             rm -f "$body"
-            printf 'body mismatch (expect "%s")' "$expect_body"
+            printf 'HTTPERR|%s|%s|%s|body mismatch (expect "%s")' \
+                "$rtt" "${size:-0}" "$code" "$expect_body"
             return 1
         fi
     fi
 
     rm -f "$body"
-    printf 'OK|%s|%s|%s' "$(to_ms "$t_total")" "${size:-0}" "$code"
+    printf '%s|%s|%s|%s' "$status" "$rtt" "${size:-0}" "$code"
     return 0
 }
 
@@ -678,34 +699,57 @@ printf '# config: %s\n' "$CONF"
 
 rtts=""
 ok_count=0
+recv_count=0
+last_http_reason=""
 i=0
 while [ "$i" -lt "$COUNT" ]; do
     result=$(probe "$URL" "$EXPBODY" "$PROTO")
-    if [ $? -eq 0 ]; then
-        rtt=$(printf '%s' "$result" | cut -d'|' -f2)
-        size=$(printf '%s' "$result" | cut -d'|' -f3)
-        code=$(printf '%s' "$result" | cut -d'|' -f4)
-        ok_count=$((ok_count + 1))
-        rtts="$rtts $rtt"
-        if [ "$PROTO" = "tcp" ]; then
-            printf 'connected  from %s:%s: tcp_seq=%d time=%s ms\n' "$HOST" "$PORT" "$i" "$rtt"
-        else
-            printf '%s bytes from %s:%s: tcp_seq=%d time=%s ms (HTTP %s)\n' \
-                "$size" "$HOST" "$PORT" "$i" "$rtt" "$code"
-        fi
-    else
-        printf '%s for tcp_seq %d\n' "$result" "$i"
-    fi
+    status=$(printf '%s' "$result" | cut -d'|' -f1)
+    case "$status" in
+        OK|REDIRECT)
+            recv_count=$((recv_count + 1))
+            ok_count=$((ok_count + 1))
+            rtt=$(printf '%s' "$result" | cut -d'|' -f2)
+            size=$(printf '%s' "$result" | cut -d'|' -f3)
+            code=$(printf '%s' "$result" | cut -d'|' -f4)
+            rtts="$rtts $rtt"
+            if [ "$status" = "REDIRECT" ]; then
+                printf 'redirect from %s:%s: tcp_seq=%d time=%s ms (HTTP %s)\n' \
+                    "$HOST" "$PORT" "$i" "$rtt" "$code"
+            elif [ "$PROTO" = "tcp" ]; then
+                printf 'connected  from %s:%s: tcp_seq=%d time=%s ms\n' "$HOST" "$PORT" "$i" "$rtt"
+            else
+                printf '%s bytes from %s:%s: tcp_seq=%d time=%s ms (HTTP %s)\n' \
+                    "$size" "$HOST" "$PORT" "$i" "$rtt" "$code"
+            fi
+            ;;
+        HTTPERR)
+            recv_count=$((recv_count + 1))
+            rtt=$(printf '%s' "$result" | cut -d'|' -f2)
+            reason=$(printf '%s' "$result" | cut -d'|' -f5-)
+            rtts="$rtts $rtt"
+            last_http_reason="$reason"
+            printf '%s for tcp_seq %d\n' "$reason" "$i"
+            ;;
+        NOREPLY)
+            reason=$(printf '%s' "$result" | cut -d'|' -f2-)
+            printf '%s for tcp_seq %d\n' "$reason" "$i"
+            ;;
+        *)
+            printf 'unexpected probe result for tcp_seq %d\n' "$i"
+            ;;
+    esac
     i=$((i + 1))
     [ "$i" -lt "$COUNT" ] && sleep "$INTERVAL"
 done
 
 # ---------------------------- 统计 -----------------------------------------
-lost=$((COUNT - ok_count))
+# lost = 完全没收到响应的次数，不再把 HTTP 状态码失败算成丢包。
+lost=$((COUNT - recv_count))
 loss=$(awk -v l="$lost" -v c="$COUNT" 'BEGIN{printf "%.1f", (c>0? l*100.0/c : 0)}')
 
 printf '\n--- %s:%s %s statistics ---\n' "$HOST" "$PORT" "$PROG"
-printf '%d probes transmitted, %d received, %s%% packet loss\n' "$COUNT" "$ok_count" "$loss"
+printf '%d probes transmitted, %d received, %s%% packet loss\n' "$COUNT" "$recv_count" "$loss"
 
 if [ -n "$rtts" ]; then
     stats=$(printf '%s\n' $rtts | awk '
@@ -724,8 +768,10 @@ fi
 
 if [ "$ok_count" -eq "$COUNT" ]; then
     printf '%s: OK\n' "$DESC"; exit 0
-elif [ "$ok_count" -eq 0 ]; then
+elif [ "$recv_count" -eq 0 ]; then
     printf '%s: FAILED (no reply)\n' "$DESC"; exit 1
+elif [ "$ok_count" -eq 0 ]; then
+    printf '%s: FAILED (%s)\n' "$DESC" "${last_http_reason:-HTTP failure}"; exit 1
 else
     printf '%s: DEGRADED (%d/%d)\n' "$DESC" "$ok_count" "$COUNT"; exit 1
 fi

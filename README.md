@@ -22,11 +22,11 @@
 ## 特性
 
 - **仿 ping 输出**：`PING ... bytes from ... time=x ms` + `min/avg/max/stddev` 统计 + 结论行
-- **两种判活语义**：`proto=http` 校验 HTTP 200（可再加响应体关键字）；`proto=tcp` 只判三次握手
+- **两种判活语义**：`proto=http` 校验 HTTP 2xx/3xx（3xx 记为 `REDIRECT` 且算健康；可再加响应体关键字）；`proto=tcp` 只判三次握手
 - **具名主机地址簿**：`ServPing nas git` —— 先 Host 后服务，服务表与主机表正交
 - **配置写坏不静默**：坏行带**行号**报错并退出 2，还会给出可直接抄的修正行
 - **可移植**：macOS 自带 bash 3.2 与各种 Linux bash 都能跑（不用关联数组、不依赖 `date +%N`）
-- **自测套件**：40 条断言，全在本机回环上跑，不需要外网
+- **自测套件**：bash 62 条 / PowerShell 56 条断言，全在本机回环上跑，不需要外网
 
 ## 快速开始
 
@@ -187,16 +187,27 @@ ServPing -H Git -s Web       # 两边都显式指定
 - `Could not resolve host` → 失败
 - 连接超时（`time_connect` 为 0）→ 失败
 
+### HTTP 状态与丢包口径（重要）
+
+| 情况 | 输出 | 算成功 | 计入 received | 计入 packet loss |
+|---|---|---|---|---|
+| 2xx | `... bytes from ... (HTTP 200)` | 是 | 是 | 否 |
+| 3xx | `redirect from ... (HTTP 302)` | 是 | 是 | 否 |
+| 4xx/5xx | `HTTP 500 unexpected (expect 2xx/3xx)` | 否 | 是 | 否 |
+| 连不上 / 超时 | `Connection refused` / `Request timeout` | 否 | 否 | 是 |
+
+** rationale**：HTTP→HTTPS、跳登录页、跳管理界面都是正常部署形态（nginx 默认就会 302），把它们报成 `100% packet loss` 会把排障方向带偏到网线/防火墙。丢包只描述"根本没拿到响应"。
+
 ## 自测
 
 ```bash
 tests/selftest.sh
 ```
 
-40 条断言，分两组：
+bash 62 条断言，分两组：
 
-- **组 1** 配置与命令行语义（不联网、不起服务）：坏行报错、缺省选择、同名规则、`-a` 写入格式、错误退出码
-- **组 2** 真实探测（需 `python3`，用它起本地 HTTP / 静默 TCP 服务）：HTTP 200、响应体命中与未命中、tcp 握手、关闭端口
+- **组 1** 配置与命令行语义（不联网、不起服务）：坏行报错、端口范围、缺省选择、同名规则、`-a` 写入格式、错误退出码、版本一致性
+- **组 2** 真实探测（需 `python3`，用它起本地 HTTP / 302 / 500 / 静默 TCP 服务）：HTTP 200、302 重定向、500 失败、响应体命中与未命中、tcp 握手、关闭端口
 
 没有 `python3` 时组 2 自动 skip，组 1 仍会跑。退出码 0 = 无失败。
 
@@ -208,7 +219,7 @@ tests/selftest.sh
 |---|---|
 | `win/ServPing.ps1` | 主脚本，Windows PowerShell 5.1+ / PowerShell 7+，需 `curl.exe`（Win10/11 与 Server 2016+ 自带） |
 | `win/ServPing.cmd` | 双击入口：优先 `pwsh.exe`，回落 `powershell.exe` 5.1；只请求一次提权 |
-| `win/selftest.ps1` | PowerShell 版自测（23 条组 1 断言 + 组 2 环境允许时的真实探测） |
+| `win/selftest.ps1` | PowerShell 版自测（组 1 配置语义 + 组 2 环境允许时的真实探测，共 56 条） |
 | `win/DESIGN.md` | 移植语义对照表（内部设计文档） |
 
 ```powershell
@@ -225,7 +236,7 @@ powershell -ExecutionPolicy Bypass -File .\win\selftest.ps1
 配置查找顺序：`-f` > `$env:SERVPING_CONFIG` > `%APPDATA%\ServPing\servping.conf`。
 **注意**：`curl` 在 PowerShell 里是 `Invoke-WebRequest` 的别名，脚本内部显式调用 `curl.exe`；手工验证时也要写 `curl.exe`。
 
-已在 **Windows PowerShell 5.1 真机**与 **PowerShell 7** 双版本实测：配置语义 23 条全过，探测逻辑（HTTP 200 / 响应体校验 / TCP 握手 / 退出码）行为与 bash 版一致。CI 在 `windows-latest` 上同时跑 5.1 与 7。
+已在 **Windows PowerShell 5.1 真机**与 **PowerShell 7** 双版本实测：自测全过，探测逻辑（HTTP 200 / 302 / 500 / 响应体校验 / TCP 握手 / 退出码）行为与 bash 版一致。CI 在 `windows-latest` 上同时跑 5.1 与 7。
 
 ## 已知限制
 
@@ -233,6 +244,17 @@ powershell -ExecutionPolicy Bypass -File .\win\selftest.ps1
 - 没有并发：多个服务要多次调用（这是刻意的 —— 仿 ping 的语义是"逐包"）。
 - `-p` / `-H` 只影响本次，不写配置。
 - 依赖 `curl` 的 `%{time_connect}`：极老的 curl（< 7.19）可能不支持。
+
+## 发布检查清单（防版本漂移）
+
+发版前逐条打勾，任一项未过不得打 tag：
+
+- [ ] `ServPing:VERSION`、`win/ServPing.ps1:$script:VERSION`、PS 头部注释 **三处 version 一致且等于本次 tag**
+- [ ] `ServPing -V` 与 `win/ServPing.ps1 -V` 均输出 `ServPing <version>`
+- [ ] `tests/selftest.sh` 与 `win/selftest.ps1` 的版本一致性断言全过
+- [ ] 双平台自测无 FAIL（bash / PowerShell 5.1 / PowerShell 7）
+- [ ] Release zip 从 annotated tag 导出，不从工作区快照导出
+- [ ] 发布后从公开 `releases/download` URL 下载回来，`cmp` + sha256 双验
 
 ## License
 

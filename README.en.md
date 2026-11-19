@@ -22,11 +22,11 @@ English · [中文](README.md)
 ## Features
 
 - **ping-like output**: `PING ... bytes from ... time=x ms`, plus `min/avg/max/stddev` and a verdict line
-- **Two liveness semantics**: `proto=http` checks HTTP 200 (optionally a body keyword); `proto=tcp` checks the three-way handshake only
+- **Two liveness semantics**: `proto=http` checks HTTP 2xx/3xx (3xx is reported as `REDIRECT` and counts as healthy; optionally a body keyword); `proto=tcp` checks the three-way handshake only
 - **Named host address book**: `ServPing nas git` — host first, then service; the two tables are orthogonal
 - **Loud on bad config**: malformed lines fail with an **exit code 2 and a line number**, plus a copy-pasteable fix
 - **Portable**: works on macOS's stock bash 3.2 and on Linux (no associative arrays, no `date +%N`)
-- **Self-test suite**: 40 assertions, all on loopback, no network required
+- **Self-test suite**: 62 bash / 56 PowerShell assertions, all on loopback, no network required
 
 ## Quick start
 
@@ -181,16 +181,27 @@ So when a service accepts the connection but never speaks HTTP (SSH, MySQL, Redi
 - `Could not resolve host` → down
 - connect timeout (`time_connect` is 0) → down
 
+### HTTP status vs. packet loss (important)
+
+| Case | Output | Healthy | `received` | `packet loss` |
+|---|---|---|---|---|
+| 2xx | `... bytes from ... (HTTP 200)` | yes | yes | no |
+| 3xx | `redirect from ... (HTTP 302)` | yes | yes | no |
+| 4xx/5xx | `HTTP 500 unexpected (expect 2xx/3xx)` | no | yes | no |
+| no response | `Connection refused` / `Request timeout` | no | no | yes |
+
+**Rationale**: HTTP→HTTPS, login redirects, and management-UI redirects are normal deployments (nginx 302s by default). Reporting them as `100% packet loss` sends troubleshooting toward cables and firewalls. Packet loss means *no HTTP response at all*.
+
 ## Self-test
 
 ```bash
 tests/selftest.sh
 ```
 
-40 assertions in two groups:
+62 bash assertions in two groups:
 
-- **Group 1** config and CLI semantics (no network): malformed-line handling, default selection, duplicate rules, `-a` write formats, error exit codes
-- **Group 2** real probing (needs `python3` to spin up local HTTP / silent TCP servers): HTTP 200, body match/mismatch, tcp handshake, closed port
+- **Group 1** config and CLI semantics (no network): malformed lines, port range, default selection, duplicate rules, `-a` write formats, error exit codes, version consistency
+- **Group 2** real probing (needs `python3` to spin up local HTTP / 302 / 500 / silent TCP servers): HTTP 200, 302 redirect, 500 failure, body match/mismatch, tcp handshake, closed port
 
 Without `python3`, group 2 is skipped and group 1 still runs. Exit code 0 means no failures.
 
@@ -202,7 +213,7 @@ The `win/` directory holds a **native PowerShell port** — semantically aligned
 |---|---|
 | `win/ServPing.ps1` | Main script, Windows PowerShell 5.1+ / PowerShell 7+; needs `curl.exe` (shipped with Win10/11 and Server 2016+) |
 | `win/ServPing.cmd` | Double-click launcher: prefers `pwsh.exe`, falls back to `powershell.exe` 5.1, requests elevation once |
-| `win/selftest.ps1` | PowerShell self-test (23 group-1 assertions plus group-2 probing when the environment allows) |
+| `win/selftest.ps1` | PowerShell self-test (56 assertions; group 2 runs when the environment allows) |
 | `win/DESIGN.md` | Porting semantics cross-reference (internal design doc) |
 
 ```powershell
@@ -217,7 +228,7 @@ powershell -ExecutionPolicy Bypass -File .\win\selftest.ps1
 Config lookup: `-f` > `$env:SERVPING_CONFIG` > `%APPDATA%\ServPing\servping.conf`.
 **Note**: in PowerShell, `curl` is an alias for `Invoke-WebRequest`; the script calls `curl.exe` explicitly — do the same when verifying by hand.
 
-Verified on **Windows PowerShell 5.1** and **PowerShell 7**: all 23 config-semantics assertions pass, and probing behaviour (HTTP 200 / body validation / TCP handshake / exit codes) matches the bash version. CI runs both 5.1 and 7 on `windows-latest`.
+Verified on **Windows PowerShell 5.1** and **PowerShell 7**: all self-tests pass, and probing behaviour (HTTP 200 / 302 / 500 / body validation / TCP handshake / exit codes) matches the bash version. CI runs both 5.1 and 7 on `windows-latest`.
 
 ## Known limitations
 
@@ -225,6 +236,17 @@ Verified on **Windows PowerShell 5.1** and **PowerShell 7**: all 23 config-seman
 - No concurrency: one service per invocation (deliberate — this is a per-probe, ping-like tool).
 - `-p` / `-H` affect the current run only, never the config file.
 - Relies on curl's `%{time_connect}`; very old curl (< 7.19) may not support it.
+
+## Release checklist (no version drift)
+
+Check every item before tagging; a release with any unchecked item must not be published:
+
+- [ ] `ServPing:VERSION`, `win/ServPing.ps1:$script:VERSION`, and the PS header comment all equal the tag version
+- [ ] `ServPing -V` and `win/ServPing.ps1 -V` both print `ServPing <version>`
+- [ ] Version-consistency assertions in both self-test suites pass
+- [ ] No FAIL on bash / PowerShell 5.1 / PowerShell 7 self-tests
+- [ ] Release zip is exported from the annotated tag, not from the working tree
+- [ ] After publishing, download the asset from the public `releases/download` URL and verify with `cmp` + sha256
 
 ## License
 
